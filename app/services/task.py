@@ -18,6 +18,7 @@ from app.models.schema import VideoConcatMode, VideoParams
 from app.services import bgm as bgm_service
 from app.services import (
     elevenlabs_music,
+    fcpxml,
     llm,
     loomloom,
     material,
@@ -857,6 +858,13 @@ def _get_material_source_groups(task_id: str, video_paths: list[str]) -> dict[st
         return {}
 
 
+def _fcp_project_name(params: VideoParams, index: int) -> str:
+    subject = (params.video_subject or "Short-Form Video").strip()
+    if len(subject) > 60:
+        subject = subject[:57].rstrip() + "..."
+    return subject if params.video_count <= 1 else f"{subject} ({index})"
+
+
 def generate_final_videos(
     task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
 ):
@@ -996,6 +1004,15 @@ def generate_final_videos(
                     "video_index": index,
                 }
             )
+
+        # Final Cut Pro 项目是可选附加产物，导出失败只记录日志，不影响成片。
+        try:
+            fcpxml.export_video_project(
+                combined_video_path,
+                project_name=_fcp_project_name(params, index),
+            )
+        except Exception as e:
+            logger.warning(f"failed to export Final Cut Pro project: {e}")
 
         _progress += 50 / params.video_count / 2
         sm.state.update_task(task_id, progress=_progress)

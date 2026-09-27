@@ -1,5 +1,6 @@
 import itertools
 import io
+import json
 import math
 import os
 import random
@@ -739,6 +740,58 @@ def _fit_clip_to_canvas(
     ).with_duration(clip.duration)
 
 
+def timeline_sidecar_path(video_path: str) -> str:
+    """
+    返回与 combined-N.mp4 对应的剪辑清单路径（timeline-N.json）。
+
+    剪辑清单记录成片使用了哪些素材、各自的源区间、旁白与配乐，
+    供 FCPXML 导出在 Final Cut Pro 中还原可编辑的时间线。
+    """
+    directory, name = os.path.split(video_path)
+    stem = os.path.splitext(name)[0]
+    if stem.startswith("combined-"):
+        stem = "timeline-" + stem[len("combined-"):]
+    else:
+        stem = f"{stem}.timeline"
+    return os.path.join(directory, f"{stem}.json")
+
+
+def _timeline_clip_entries(processed_clips, audio_duration: float) -> list[dict]:
+    # 只保留旁白时长内真正出现在成片里的片段，最后一段按旁白结束点截断，
+    # 与 concat_video_clips_with_ffmpeg(max_duration=audio_duration) 的结果一致。
+    entries = []
+    elapsed = 0.0
+    for clip in processed_clips:
+        if elapsed >= audio_duration:
+            break
+        duration = min(clip.duration, audio_duration - elapsed)
+        entries.append(
+            {
+                "source": clip.source_file_path,
+                "source_start": clip.start_time or 0.0,
+                "duration": duration,
+            }
+        )
+        elapsed += duration
+    return entries
+
+
+def _write_timeline_sidecar(video_path: str, **fields) -> None:
+    # 剪辑清单只服务于可选的 FCPXML 导出，写入失败不能影响视频生成。
+    sidecar = timeline_sidecar_path(video_path)
+    try:
+        data = {}
+        if os.path.exists(sidecar):
+            with open(sidecar, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        data.update(fields)
+        data.setdefault("version", 1)
+        with open(sidecar, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"failed to write timeline sidecar {sidecar}: {e}")
+
+
 def combine_videos(
     combined_video_path: str,
     video_paths: List[str],
@@ -915,9 +968,14 @@ def combine_videos(
             clip_duration_saved = clip.duration
             close_clip(clip)
 
+            # start_time/end_time 记录源素材中实际使用的区间，供 FCPXML 导出
+            # 还原剪辑点；duration 仍是成片中的播放时长。
             processed_clips.append(
                 SubClippedVideoClip(
                     file_path=clip_file,
+                    start_time=subclipped_item.start_time,
+                    end_time=subclipped_item.start_time
+                    + clip_duration_saved * normalized_clip_speed,
                     duration=clip_duration_saved,
                     width=clip_w,
                     height=clip_h,
@@ -970,7 +1028,20 @@ def combine_videos(
                 break
             used_video_paths.append(clip.source_file_path)
             elapsed += clip.duration
-    
+
+    _write_timeline_sidecar(
+        combined_video_path,
+        width=video_width,
+        height=video_height,
+        fps=fps,
+        fit_mode=fit_mode.value,
+        transition=transition_value,
+        speed=normalized_clip_speed,
+        audio_file=audio_file,
+        audio_duration=audio_duration,
+        clips=_timeline_clip_entries(processed_clips, audio_duration),
+    )
+
     # clean temp files
     delete_files(clip_files)
             
@@ -1502,6 +1573,24 @@ def generate_video(
                     f"failed to mix background music: type={params.bgm_type}, "
                     f"file={bgm_file}"
                 )
+
+        _write_timeline_sidecar(
+            video_path,
+            final_video=output_file,
+            subtitle_file=subtitle_path if params.subtitle_enabled else "",
+            subtitle_style={
+                "font_name": params.font_name,
+                "font_size": params.font_size,
+                "color": params.text_fore_color,
+                "position": params.subtitle_position,
+            },
+            bgm={
+                "file": bgm_file if bgm_file and bgm_mix_succeeded else "",
+                "volume": params.bgm_volume,
+                # 随机/自定义配乐会循环铺满成片；提供商生成的配乐已匹配时长。
+                "loop": bgm_file_override is None,
+            },
+        )
 
         final_video_clip = video_clip.with_audio(audio_clip)
         clip_stack.callback(final_video_clip.close)
